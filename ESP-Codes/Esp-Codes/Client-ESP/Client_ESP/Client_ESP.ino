@@ -1,7 +1,7 @@
 // =====================================================
 // ROLE: CLIENT  (ESP #2)
-// Sends live game state via HTTP to Webserver-ESP
-// Reliable setup: WiFi/Webserver on ch11, ESP-NOW uses same current channel
+// Fixed DUO channel: ESP-NOW always uses channel 11 in DUO mode
+// Note: To guarantee fixed ch11, normal WiFi is disconnected while DUO is active
 // =====================================================
 struct Move { int r; int c; };
 
@@ -127,9 +127,48 @@ static inline int clampi(int v,int lo,int hi){ return (v<lo)?lo:(v>hi)?hi:v; }
 bool pointInRect(int x,int y,int rx,int ry,int rw,int rh){ return (x>=rx && x<rx+rw && y>=ry && y<ry+rh); }
 bool isSelfMac(const uint8_t mac[6]){ return memcmp(mac,myMac,6)==0; }
 
-uint8_t currentEspNowChannel(){
-  if(WiFi.status() == WL_CONNECTED && gWifiChannel != 0) return gWifiChannel;
+uint8_t getRadioChannel(){
+  uint8_t ch = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  if(esp_wifi_get_channel(&ch, &second) == ESP_OK && ch != 0) return ch;
   return DUO_CHANNEL;
+}
+
+uint8_t currentEspNowChannel(){
+  return getRadioChannel();
+}
+
+bool setFixedDuoChannel(){
+  wifiOk = false;
+  gWifiChannel = 0;
+
+  if(WiFi.status() == WL_CONNECTED){
+    esp_wifi_disconnect();
+    uint32_t t0 = millis();
+    while(WiFi.status() == WL_CONNECTED && millis() - t0 < 1500){
+      delay(10);
+    }
+  }
+
+  delay(50);
+
+  esp_err_t err = esp_wifi_set_channel(DUO_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  uint8_t realCh = getRadioChannel();
+
+  Serial.print("Set DUO channel request=");
+  Serial.print((int)DUO_CHANNEL);
+  Serial.print(" result=");
+  Serial.print((int)err);
+  Serial.print(" actual=");
+  Serial.println((int)realCh);
+
+  return (err == ESP_OK && realCh == DUO_CHANNEL);
+}
+
+void restoreWifiForHttpIfNeeded(){
+  if(gameMode == GM_DUO) return;
+  if(wifiOk && WiFi.status() == WL_CONNECTED) return;
+  connectWifi();
 }
 
 void beginTrackedGame(){
@@ -169,7 +208,7 @@ bool connectWifi(){
     Serial.println(gWifiChannel);
 
     if(gWifiChannel != DUO_CHANNEL){
-      Serial.println("WARNING: WiFi/AP channel != DUO_CHANNEL. DUO will only work if HOST uses the same channel as WiFi.");
+      Serial.println("INFO: WLAN ist nicht auf Kanal 11. Fuer festen DUO-Kanal wird WLAN im DUO-Modus getrennt.");
     }
     return true;
   }
@@ -178,8 +217,8 @@ bool connectWifi(){
   gWifiChannel = 0;
   esp_wifi_set_channel(DUO_CHANNEL, WIFI_SECOND_CHAN_NONE);
   Serial.println("WiFi connect failed. HTTP disabled.");
-  Serial.print("Fallback ESP-NOW channel=");
-  Serial.println(DUO_CHANNEL);
+  Serial.print("Fallback radio channel=");
+  Serial.println((int)getRadioChannel());
   return false;
 }
 
@@ -215,7 +254,7 @@ void pushStateToWeb(const char* eventName){
   body += "&remoteSymbol="; body += remoteSymbol;
   body += "&board=" + boardToWire();
   body += "&event="; body += eventName;
-  body += "&channel=" + String((int)gWifiChannel);
+  body += "&channel=" + String((int)currentEspNowChannel());
 
   int httpCode = http.POST(body);
   String resp = http.getString();
@@ -481,7 +520,7 @@ bool ensurePeer(const uint8_t mac[6]){
   if(esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t p{};
   memcpy(p.peer_addr, mac, 6);
-  p.channel = 0;              // use current local channel
+  p.channel = 0;              // always use the currently active radio channel
   p.encrypt = false;
   p.ifidx   = WIFI_IF_STA;
   return (esp_now_add_peer(&p) == ESP_OK);
@@ -498,8 +537,14 @@ void duoStartAsClient(){
   clearBoardState();
   gameMode=GM_DUO;
   duoWaiting=true;
+
+  bool chOk = setFixedDuoChannel();
   drawDuoWaitScreen();
-  pushStateToWeb("duo_wait");
+
+  if(!chOk){
+    setFooter("DUO Kanal 11 Fehler");
+    Serial.println("ERROR: Could not switch radio to DUO_CHANNEL.");
+  }
 }
 
 void sendHelloAckToHost(){
@@ -624,6 +669,7 @@ void redrawGame(){
 void startLocal2P(){
   duoResetLocalState();
   gameMode=GM_LOCAL_2P;
+  restoreWifiForHttpIfNeeded();
   humanSymbol='X'; aiSymbol='O';
   beginTrackedGame();
   clearBoardState();
@@ -634,6 +680,7 @@ void startLocal2P(){
 void startAI(GameMode m){
   duoResetLocalState();
   gameMode=m;
+  restoreWifiForHttpIfNeeded();
   drawAIStartScreen();
 }
 
@@ -748,8 +795,18 @@ void loop(){
         maybeAIMove();
       }
     } else {
-      mode=MODE_GAME;
-      redrawGame();
+      if(mode==MODE_DUO_WAIT){
+        duoResetLocalState();
+        gameMode=GM_LOCAL_2P;
+        restoreWifiForHttpIfNeeded();
+        beginTrackedGame();
+        clearBoardState();
+        redrawGame();
+        pushStateToWeb("duo_cancel");
+      } else {
+        mode=MODE_GAME;
+        redrawGame();
+      }
     }
     return;
   }
