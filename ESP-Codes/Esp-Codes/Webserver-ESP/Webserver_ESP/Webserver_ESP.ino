@@ -448,7 +448,7 @@ async function tick(){
 
     let status = "";
     if(s.screenMode === 3 && !s.duoConnected){
-      status = "DUO: Warte auf Host...";
+      status = "DUO: Warte auf Gegner...";
     } else if(s.gameOver){
       status = (s.winner === 'D') ? "Unentschieden" : ("Gewinner: " + s.winner);
     } else {
@@ -578,18 +578,18 @@ void handleState(){
 
 void handlePush(){
   LiveState s{};
-  s.gameId       = (uint32_t)server.arg("game_id").toInt();
-  s.seq          = (uint8_t)server.arg("seq").toInt();
-  s.gameMode     = (uint8_t)server.arg("gameMode").toInt();
-  s.screenMode   = (uint8_t)server.arg("screenMode").toInt();
+  s.gameId        = (uint32_t)server.arg("game_id").toInt();
+  s.seq           = (uint8_t)server.arg("seq").toInt();
+  s.gameMode      = (uint8_t)server.arg("gameMode").toInt();
+  s.screenMode    = (uint8_t)server.arg("screenMode").toInt();
   s.currentPlayer = normalizeCharField(server.arg("currentPlayer"), ' ');
-  s.gameOver     = (uint8_t)server.arg("gameOver").toInt();
-  s.winner       = normalizeCharField(server.arg("winner"), ' ');
-  s.duoConnected = (uint8_t)server.arg("duoConnected").toInt();
-  s.localSymbol  = normalizeCharField(server.arg("localSymbol"), ' ');
-  s.remoteSymbol = normalizeCharField(server.arg("remoteSymbol"), ' ');
-  s.channel      = (uint8_t)server.arg("channel").toInt();
-  s.lastUpdateMs = millis();
+  s.gameOver      = (uint8_t)server.arg("gameOver").toInt();
+  s.winner        = normalizeCharField(server.arg("winner"), ' ');
+  s.duoConnected  = (uint8_t)server.arg("duoConnected").toInt();
+  s.localSymbol   = normalizeCharField(server.arg("localSymbol"), ' ');
+  s.remoteSymbol  = normalizeCharField(server.arg("remoteSymbol"), ' ');
+  s.channel       = (uint8_t)server.arg("channel").toInt();
+  s.lastUpdateMs  = millis();
 
   String board = server.arg("board");
   for(int i=0;i<9;i++){
@@ -627,6 +627,10 @@ void handlePush(){
   Serial.print((int)s.seq);
   Serial.print(" mode=");
   Serial.print((int)s.gameMode);
+  Serial.print(" role=");
+  Serial.print(s.role);
+  Serial.print(" ch=");
+  Serial.print((int)s.channel);
   Serial.print(" event=");
   Serial.println(s.eventName);
 }
@@ -642,7 +646,7 @@ static void connectWifi(){
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   uint32_t start = millis();
-  while(WiFi.status() != WL_CONNECTED && millis()-start < 15000){
+  while(WiFi.status() != WL_CONNECTED && millis() - start < 15000){
     delay(200);
   }
 
@@ -667,6 +671,11 @@ void setup(){
   server.on("/", handleRoot);
   server.on("/state", HTTP_GET, handleState);
   server.on("/push", HTTP_POST, handlePush);
+
+  server.onNotFound([](){
+    server.send(404, "text/plain", "Not found");
+  });
+
   server.begin();
 
   Serial.println("Webserver started");

@@ -1,6 +1,7 @@
 // =====================================================
 // ROLE: HOST  (ESP #1)
-// Reliable setup: fixed DUO channel 11 to match AP/Webserver channel
+// Fixed: Host now follows the current WLAN channel instead of forcing ch11.
+// This keeps ESP-NOW compatible with the client that stays on WLAN for HTTP.
 // =====================================================
 struct Move { int r; int c; };
 
@@ -14,9 +15,13 @@ struct Move { int r; int c; };
 #include <esp_wifi.h>
 #include <esp_system.h>
 
-#define DUO_CHANNEL 11
+#define DUO_FALLBACK_CHANNEL 11
 
-// ---------- ESP32-S3 GPIO Zuordnung (NICHT ändern) ----------
+// ===== WLAN =====
+const char* WIFI_SSID = "IOT";
+const char* WIFI_PASS = "20tgmiot18";
+
+// ---------- ESP32-S3 GPIO ----------
 #define TFT_DC    9
 #define TFT_CS   10
 #define TFT_RST   8
@@ -77,6 +82,10 @@ char humanSymbol='X', aiSymbol='O';
 int bx0, by0, bsize, cell;
 String footerMsg="";
 
+// WLAN / channel
+bool wifiOk = false;
+uint8_t gWifiChannel = 0;
+
 // ---------- DUO (ESP-NOW) ----------
 bool duoWaiting=false;
 bool duoConnected=false;
@@ -99,7 +108,7 @@ struct __attribute__((packed)) EspMsg {
   uint8_t r;
   uint8_t c;
   uint8_t seq;
-  uint8_t flags;   // START: bit0 = receiverIsX (für Client)
+  uint8_t flags;   // START: bit0 = receiverIsX (for client)
   uint32_t n1;     // HELLO: hostRand, ACK: clientRand, START: hostRand, RESET_REQ(host->client): hostRand
   uint32_t n2;     // START: clientRand
 };
@@ -120,6 +129,72 @@ bool awaitingClientRand = false;
 static inline int clampi(int v,int lo,int hi){ return (v<lo)?lo:(v>hi)?hi:v; }
 bool pointInRect(int x,int y,int rx,int ry,int rw,int rh){ return (x>=rx && x<rx+rw && y>=ry && y<ry+rh); }
 bool isSelfMac(const uint8_t mac[6]){ return memcmp(mac,myMac,6)==0; }
+
+uint8_t getRadioChannel(){
+  uint8_t ch = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  if(esp_wifi_get_channel(&ch, &second) == ESP_OK && ch != 0) return ch;
+  return DUO_FALLBACK_CHANNEL;
+}
+
+uint8_t currentEspNowChannel(){
+  return getRadioChannel();
+}
+
+bool connectWifi(uint32_t timeoutMs = 15000){
+  if(WiFi.status() == WL_CONNECTED){
+    wifiOk = true;
+    gWifiChannel = (uint8_t)WiFi.channel();
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while(WiFi.status() != WL_CONNECTED && millis()-start < timeoutMs){
+    delay(200);
+  }
+
+  if(WiFi.status() == WL_CONNECTED){
+    wifiOk = true;
+    gWifiChannel = (uint8_t)WiFi.channel();
+
+    Serial.print("HOST WiFi connected. IP=");
+    Serial.println(WiFi.localIP());
+    Serial.print("HOST WiFi channel=");
+    Serial.println((int)gWifiChannel);
+    return true;
+  }
+
+  wifiOk = false;
+  gWifiChannel = 0;
+  esp_wifi_set_channel(DUO_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  Serial.println("HOST WiFi connect failed.");
+  Serial.print("HOST fallback radio channel=");
+  Serial.println((int)getRadioChannel());
+  return false;
+}
+
+bool prepareDuoTransport(){
+  if(connectWifi(6000)){
+    Serial.print("HOST DUO uses current WiFi channel=");
+    Serial.println((int)WiFi.channel());
+    return true;
+  }
+
+  esp_err_t err = esp_wifi_set_channel(DUO_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  delay(20);
+
+  Serial.print("HOST DUO fallback channel=");
+  Serial.print(DUO_FALLBACK_CHANNEL);
+  Serial.print(" result=");
+  Serial.println((int)err);
+
+  return (err == ESP_OK);
+}
 
 void updateThemeColors(){
   if(!lightMode){
@@ -179,6 +254,7 @@ void drawTopButton(const char* label){
   tft.setCursor(rx+10,ry+6);
   tft.print(label);
 }
+
 void drawFooterButtonSettings(){
   int rx=tft.width()-PAD-SETBTN_W;
   int ry=tft.height()-FOOTER_H+(FOOTER_H-SETBTN_H)/2;
@@ -189,6 +265,7 @@ void drawFooterButtonSettings(){
   tft.setCursor(rx+10,ry+5);
   tft.print("EINSTELL.");
 }
+
 void drawAppBar(const char* title){
   tft.fillRect(0,0,tft.width(),APPBAR_H,C_APPBAR);
   tft.setTextSize(2);
@@ -200,6 +277,7 @@ void drawAppBar(const char* title){
   tft.drawFastHLine(0,tft.height()-FOOTER_H-1,tft.width(),C_BTN_BORDER);
   tft.fillRect(0,tft.height()-FOOTER_H,tft.width(),FOOTER_H,C_FOOTER_BG);
 }
+
 void setFooter(const String& msg){
   footerMsg=msg;
   tft.fillRect(0,tft.height()-FOOTER_H,tft.width(),FOOTER_H,C_FOOTER_BG);
@@ -209,16 +287,19 @@ void setFooter(const String& msg){
   tft.print(footerMsg);
   drawFooterButtonSettings();
 }
+
 void drawX(int cx,int cy,int r){
   tft.drawLine(cx-r,cy-r,cx+r,cy+r,C_X);
   tft.drawLine(cx-r,cy+r,cx+r,cy-r,C_X);
   tft.drawLine(cx-r+1,cy-r,cx+r+1,cy+r,C_X);
   tft.drawLine(cx-r+1,cy+r,cx+r+1,cy-r,C_X);
 }
+
 void drawO(int cx,int cy,int r){
   tft.drawCircle(cx,cy,r,C_O);
   tft.drawCircle(cx,cy,r-1,C_O);
 }
+
 void drawMark(int r,int c,char m){
   int x1=bx0+c*cell;
   int y1=by0+r*cell;
@@ -228,6 +309,7 @@ void drawMark(int r,int c,char m){
   if(m=='X') drawX(cx,cy,rad);
   if(m=='O') drawO(cx,cy,rad);
 }
+
 void drawBoard(){
   computeBoardRect();
   tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
@@ -289,7 +371,7 @@ void drawDuoWaitScreen(){
   tft.setTextSize(1);
   tft.setCursor(PAD,APPBAR_H+70);
   tft.print("Kanal: ");
-  tft.print(DUO_CHANNEL);
+  tft.print((int)currentEspNowChannel());
 }
 
 // ---------- touch ----------
@@ -315,6 +397,7 @@ Move randomMove(){
   int k=random(n);
   return {e[k][0],e[k][1]};
 }
+
 int minimax(int depth,bool maximizing){
   char w=checkWinner();
   if(w==aiSymbol) return 10-depth;
@@ -338,6 +421,7 @@ int minimax(int depth,bool maximizing){
     return best;
   }
 }
+
 Move bestMove(){
   int bestVal=-1000; Move best{-1,-1};
   for(int r=0;r<3;r++) for(int c=0;c<3;c++) if(board[r][c]==' '){
@@ -382,12 +466,21 @@ void duoResetLocalState(){
 
 void duoStartAsHost(){
   duoResetLocalState();
+  clearBoardState();
   gameMode=GM_DUO;
+  hostRand = esp_random();
+
+  bool ok = prepareDuoTransport();
   duoWaiting=true;
   drawDuoWaitScreen();
+
+  if(!ok){
+    setFooter("DUO Kanal Fehler");
+    Serial.println("ERROR: Could not prepare DUO transport.");
+  }
 }
 
-// HOST: send HELLO broadcast (enthält hostRand)
+// HOST: send HELLO broadcast (contains hostRand)
 void sendHelloBroadcast(){
   EspMsg m{};
   m.type=MSG_HELLO; m.ver=1;
@@ -421,7 +514,7 @@ void sendStartToClient(){
   ensurePeer(peerMac);
   esp_now_send(peerMac, (uint8_t*)&m, sizeof(m));
 
-  // Host setzt Symbole
+  // Host sets symbols
   localSymbol  = clientIsX ? 'O' : 'X';
   remoteSymbol = clientIsX ? 'X' : 'O';
 
@@ -505,7 +598,10 @@ bool applyMove(int r,int c,char sym,bool drawIt){
   if(moveSeq < 255) moveSeq++;
 
   char w=checkWinner();
-  if(w!=' '){ setGameOverFooter(w); return true; }
+  if(w!=' '){
+    setGameOverFooter(w);
+    return true;
+  }
 
   currentPlayer = (sym=='X') ? 'O' : 'X';
   setFooter(turnMessage());
@@ -552,6 +648,7 @@ bool topHit(int x,int y){
   int ry=(APPBAR_H-TOPBTN_H)/2;
   return pointInRect(x,y,rx,ry,TOPBTN_W,TOPBTN_H);
 }
+
 bool settingsHit(int x,int y){
   int rx=tft.width()-PAD-SETBTN_W;
   int ry=tft.height()-FOOTER_H+(FOOTER_H-SETBTN_H)/2;
@@ -570,15 +667,8 @@ void setup(){
 
   randomSeed((uint32_t)esp_random());
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.disconnect(true,true);
-  delay(100);
-  esp_wifi_set_channel(DUO_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  connectWifi();
   esp_wifi_get_mac(WIFI_IF_STA, myMac);
-
-  Serial.print("HOST ESP-NOW channel=");
-  Serial.println(DUO_CHANNEL);
 
   if(esp_now_init()!=ESP_OK){
     Serial.println("ESP-NOW init failed");
@@ -587,20 +677,17 @@ void setup(){
     ensurePeer(BCAST);
   }
 
-  hostRand = esp_random();
-
   tft.fillScreen(C_BG);
   clearBoardState();
   redrawGame();
 }
 
 void loop(){
-  // HOST: im DUO wait -> HELLO broadcast
+  // HOST: in DUO wait -> HELLO broadcast
   static uint32_t lastHello=0;
   if(mode==MODE_DUO_WAIT && duoWaiting && !duoConnected){
     if(millis()-lastHello > 600){
       lastHello=millis();
-      hostRand = esp_random();
       sendHelloBroadcast();
     }
   }
@@ -645,8 +732,15 @@ void loop(){
         maybeAIMove();
       }
     } else {
-      mode=MODE_GAME;
-      redrawGame();
+      if(mode==MODE_DUO_WAIT){
+        duoResetLocalState();
+        gameMode=GM_LOCAL_2P;
+        clearBoardState();
+        redrawGame();
+      } else {
+        mode=MODE_GAME;
+        redrawGame();
+      }
     }
     return;
   }
@@ -667,7 +761,9 @@ void loop(){
 
     int ty=y0+196, th=34;
     if(pointInRect(x,y,PAD,ty,bw,th)){
-      lightMode=!lightMode; updateThemeColors(); redrawGame();
+      lightMode=!lightMode;
+      updateThemeColors();
+      drawSettingsScreen();
       return;
     }
     return;

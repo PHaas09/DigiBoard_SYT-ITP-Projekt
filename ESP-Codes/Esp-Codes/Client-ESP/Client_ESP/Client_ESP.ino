@@ -1,7 +1,7 @@
 // =====================================================
 // ROLE: CLIENT  (ESP #2)
-// Fixed DUO channel: ESP-NOW always uses channel 11 in DUO mode
-// Note: To guarantee fixed ch11, normal WiFi is disconnected while DUO is active
+// Fixed: DUO now keeps WLAN connected, so HTTP push to webserver
+// works during ESP-NOW games as long as all devices are on the same WLAN.
 // =====================================================
 struct Move { int r; int c; };
 
@@ -17,7 +17,7 @@ struct Move { int r; int c; };
 #include <esp_wifi.h>
 #include <esp_system.h>
 
-#define DUO_CHANNEL 11
+#define DUO_FALLBACK_CHANNEL 11
 
 // ===== WLAN / Webserver =====
 const char* WIFI_SSID = "IOT";
@@ -131,44 +131,70 @@ uint8_t getRadioChannel(){
   uint8_t ch = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   if(esp_wifi_get_channel(&ch, &second) == ESP_OK && ch != 0) return ch;
-  return DUO_CHANNEL;
+  return DUO_FALLBACK_CHANNEL;
 }
 
 uint8_t currentEspNowChannel(){
   return getRadioChannel();
 }
 
-bool setFixedDuoChannel(){
+bool connectWifi(uint32_t timeoutMs = 15000){
+  if(WiFi.status() == WL_CONNECTED){
+    wifiOk = true;
+    gWifiChannel = (uint8_t)WiFi.channel();
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while(WiFi.status() != WL_CONNECTED && millis()-start < timeoutMs){
+    delay(200);
+  }
+
+  if(WiFi.status() == WL_CONNECTED){
+    wifiOk = true;
+    gWifiChannel = (uint8_t)WiFi.channel();
+
+    Serial.print("WiFi connected. IP=");
+    Serial.println(WiFi.localIP());
+    Serial.print("WiFi channel=");
+    Serial.println((int)gWifiChannel);
+    return true;
+  }
+
   wifiOk = false;
   gWifiChannel = 0;
 
-  if(WiFi.status() == WL_CONNECTED){
-    esp_wifi_disconnect();
-    uint32_t t0 = millis();
-    while(WiFi.status() == WL_CONNECTED && millis() - t0 < 1500){
-      delay(10);
-    }
+  esp_wifi_set_channel(DUO_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  Serial.println("WiFi connect failed. HTTP disabled.");
+  Serial.print("Fallback radio channel=");
+  Serial.println((int)getRadioChannel());
+  return false;
+}
+
+bool prepareDuoTransport(){
+  if(connectWifi(6000)){
+    Serial.print("DUO uses current WiFi channel=");
+    Serial.println((int)WiFi.channel());
+    return true;
   }
 
-  delay(50);
+  esp_err_t err = esp_wifi_set_channel(DUO_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  delay(20);
 
-  esp_err_t err = esp_wifi_set_channel(DUO_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  uint8_t realCh = getRadioChannel();
-
-  Serial.print("Set DUO channel request=");
-  Serial.print((int)DUO_CHANNEL);
+  Serial.print("DUO fallback channel=");
+  Serial.print(DUO_FALLBACK_CHANNEL);
   Serial.print(" result=");
-  Serial.print((int)err);
-  Serial.print(" actual=");
-  Serial.println((int)realCh);
+  Serial.println((int)err);
 
-  return (err == ESP_OK && realCh == DUO_CHANNEL);
+  return (err == ESP_OK);
 }
 
 void restoreWifiForHttpIfNeeded(){
-  if(gameMode == GM_DUO) return;
-  if(wifiOk && WiFi.status() == WL_CONNECTED) return;
-  connectWifi();
+  connectWifi(4000);
 }
 
 void beginTrackedGame(){
@@ -188,48 +214,20 @@ String boardToWire(){
   return s;
 }
 
-bool connectWifi(){
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  uint32_t start = millis();
-  while(WiFi.status() != WL_CONNECTED && millis()-start < 15000){
-    delay(200);
-  }
-
-  if(WiFi.status() == WL_CONNECTED){
-    wifiOk = true;
-    gWifiChannel = (uint8_t)WiFi.channel();
-
-    Serial.print("WiFi connected. IP=");
-    Serial.println(WiFi.localIP());
-    Serial.print("WiFi channel=");
-    Serial.println(gWifiChannel);
-
-    if(gWifiChannel != DUO_CHANNEL){
-      Serial.println("INFO: WLAN ist nicht auf Kanal 11. Fuer festen DUO-Kanal wird WLAN im DUO-Modus getrennt.");
-    }
-    return true;
-  }
-
-  wifiOk = false;
-  gWifiChannel = 0;
-  esp_wifi_set_channel(DUO_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  Serial.println("WiFi connect failed. HTTP disabled.");
-  Serial.print("Fallback radio channel=");
-  Serial.println((int)getRadioChannel());
-  return false;
-}
-
 void pushStateToWeb(const char* eventName){
-  if(!wifiOk) return;
-  if(WiFi.status() != WL_CONNECTED) return;
+  if(WiFi.status() != WL_CONNECTED){
+    wifiOk = false;
+    connectWifi(3000);
+  }
+  if(WiFi.status() != WL_CONNECTED){
+    Serial.println("HTTP push skipped: WiFi not connected");
+    return;
+  }
 
   WiFiClient client;
   HTTPClient http;
-  http.setConnectTimeout(400);
-  http.setTimeout(600);
+  http.setConnectTimeout(700);
+  http.setTimeout(900);
 
   if(!http.begin(client, WEBSERVER_PUSH_URL)){
     Serial.println("HTTP begin failed");
@@ -239,6 +237,7 @@ void pushStateToWeb(const char* eventName){
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
   char winnerChar = (lastWinner==' ') ? '_' : lastWinner;
+
   String body;
   body.reserve(240);
   body += "role=CLIENT";
@@ -520,7 +519,7 @@ bool ensurePeer(const uint8_t mac[6]){
   if(esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t p{};
   memcpy(p.peer_addr, mac, 6);
-  p.channel = 0;              // always use the currently active radio channel
+  p.channel = 0;              // use current local radio channel
   p.encrypt = false;
   p.ifidx   = WIFI_IF_STA;
   return (esp_now_add_peer(&p) == ESP_OK);
@@ -538,12 +537,12 @@ void duoStartAsClient(){
   gameMode=GM_DUO;
   duoWaiting=true;
 
-  bool chOk = setFixedDuoChannel();
+  bool ok = prepareDuoTransport();
   drawDuoWaitScreen();
 
-  if(!chOk){
-    setFooter("DUO Kanal 11 Fehler");
-    Serial.println("ERROR: Could not switch radio to DUO_CHANNEL.");
+  if(!ok){
+    setFooter("DUO Kanal Fehler");
+    Serial.println("ERROR: Could not prepare DUO transport.");
   }
 }
 
@@ -826,7 +825,9 @@ void loop(){
 
     int ty=y0+196, th=34;
     if(pointInRect(x,y,PAD,ty,bw,th)){
-      lightMode=!lightMode; updateThemeColors(); redrawGame();
+      lightMode=!lightMode;
+      updateThemeColors();
+      drawSettingsScreen();
       return;
     }
     return;
@@ -837,14 +838,16 @@ void loop(){
     if(pointInRect(x,y,PAD,y0,bw,bh)){
       humanSymbol='X'; aiSymbol='O';
       beginTrackedGame();
-      clearBoardState(); redrawGame();
+      clearBoardState();
+      redrawGame();
       pushStateToWeb("start");
       return;
     }
     if(pointInRect(x,y,PAD,y0+70,bw,bh)){
       aiSymbol='X'; humanSymbol='O';
       beginTrackedGame();
-      clearBoardState(); redrawGame();
+      clearBoardState();
+      redrawGame();
       pushStateToWeb("start");
       maybeAIMove();
       return;
