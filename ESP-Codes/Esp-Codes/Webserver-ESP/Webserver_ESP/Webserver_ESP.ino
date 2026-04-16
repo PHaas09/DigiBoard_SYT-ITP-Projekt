@@ -91,14 +91,46 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       --shadow:0 10px 32px rgba(0,0,0,.35);
     }
 
+    body.citrus{
+      --bg:#fffdf1;
+      --card:#fffef8;
+      --text:#3d3200;
+      --muted:#7a6a1a;
+      --border:#d6b400;
+      --cell:#fff7bf;
+      --btn:#fff8d9;
+      --btnText:#3d3200;
+      --accent:#f2c200;
+      --hintBg:rgba(242,194,0,0.18);
+      --ghost:rgba(61,50,0,0.35);
+      --shadow:0 10px 30px rgba(156,122,0,.16);
+      background-image:
+        radial-gradient(ellipse 24px 16px at 42px 52px, rgba(255,228,92,0.85) 0 72%, rgba(214,180,0,0.85) 73% 82%, transparent 83%),
+        radial-gradient(ellipse 10px 6px at 66px 36px, rgba(109,187,82,0.80) 0 70%, transparent 71%),
+        radial-gradient(ellipse 10px 6px at 58px 34px, rgba(136,204,98,0.80) 0 70%, transparent 71%),
+
+        radial-gradient(ellipse 22px 15px at 148px 108px, rgba(255,236,112,0.82) 0 72%, rgba(214,180,0,0.82) 73% 82%, transparent 83%),
+        radial-gradient(ellipse 9px 5px at 127px 90px, rgba(109,187,82,0.78) 0 70%, transparent 71%),
+        radial-gradient(ellipse 9px 5px at 136px 84px, rgba(136,204,98,0.78) 0 70%, transparent 71%),
+
+        radial-gradient(ellipse 20px 13px at 95px 160px, rgba(255,231,95,0.78) 0 72%, rgba(214,180,0,0.78) 73% 82%, transparent 83%),
+        radial-gradient(ellipse 8px 5px at 112px 145px, rgba(109,187,82,0.74) 0 70%, transparent 71%),
+
+        radial-gradient(circle at 55px 60px, rgba(255,245,180,0.55) 0 2px, transparent 2.2px),
+        radial-gradient(circle at 44px 50px, rgba(255,245,180,0.55) 0 2px, transparent 2.2px),
+        radial-gradient(circle at 152px 112px, rgba(255,245,180,0.50) 0 2px, transparent 2.2px),
+        radial-gradient(circle at 98px 164px, rgba(255,245,180,0.45) 0 2px, transparent 2.2px);
+      background-size:190px 190px;
+    }
+
     * { box-sizing:border-box; }
 
     body {
       font-family: Arial, sans-serif;
       margin: 18px;
-      background:var(--bg);
+      background-color:var(--bg);
       color:var(--text);
-      transition: background .2s ease, color .2s ease;
+      transition: background-color .2s ease, color .2s ease;
     }
 
     .wrap {
@@ -227,7 +259,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="topbar">
         <h2 style="margin:0;">TicTacToe Live</h2>
         <div class="controls">
-          <button id="themeBtn" class="btn">Darkmode</button>
+          <button id="themeBtn" class="btn">Theme: White</button>
           <button id="hintBtn" class="btn primary">KI-Zug anzeigen</button>
         </div>
       </div>
@@ -250,6 +282,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <script>
 let lastState = null;
 let hintActive = false;
+const THEMES = ['light', 'dark', 'citrus'];
 
 function modeName(m){
   if(m === 0) return "2 Spieler";
@@ -416,14 +449,39 @@ function setHintActive(active){
   }
 }
 
-function applyTheme(isDark){
-  document.body.classList.toggle('dark', isDark);
-  localStorage.setItem('ttt_darkmode', isDark ? '1' : '0');
-  document.getElementById('themeBtn').textContent = isDark ? 'Lightmode' : 'Darkmode';
+function updateThemeButton(theme){
+  const btn = document.getElementById('themeBtn');
+  if(theme === 'dark'){
+    btn.textContent = 'Theme: Dark';
+  } else if(theme === 'citrus'){
+    btn.textContent = 'Theme: Citrus';
+  } else {
+    btn.textContent = 'Theme: White';
+  }
 }
 
-function toggleTheme(){
-  applyTheme(!document.body.classList.contains('dark'));
+function applyTheme(theme){
+  document.body.classList.remove('dark', 'citrus');
+
+  if(theme === 'dark'){
+    document.body.classList.add('dark');
+  } else if(theme === 'citrus'){
+    document.body.classList.add('citrus');
+  }
+
+  localStorage.setItem('ttt_theme', theme);
+  localStorage.setItem('ttt_darkmode', theme === 'dark' ? '1' : '0');
+  updateThemeButton(theme);
+}
+
+function cycleTheme(){
+  const current =
+    document.body.classList.contains('dark') ? 'dark' :
+    document.body.classList.contains('citrus') ? 'citrus' : 'light';
+
+  const idx = THEMES.indexOf(current);
+  const next = THEMES[(idx + 1) % THEMES.length];
+  applyTheme(next);
 }
 
 async function tick(){
@@ -467,7 +525,7 @@ async function tick(){
   }catch(e){}
 }
 
-document.getElementById('themeBtn').addEventListener('click', toggleTheme);
+document.getElementById('themeBtn').addEventListener('click', cycleTheme);
 
 const hintBtn = document.getElementById('hintBtn');
 
@@ -485,7 +543,12 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('blur', () => setHintActive(false));
 
-applyTheme(localStorage.getItem('ttt_darkmode') === '1');
+const savedTheme = localStorage.getItem('ttt_theme');
+if(savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'citrus'){
+  applyTheme(savedTheme);
+} else {
+  applyTheme(localStorage.getItem('ttt_darkmode') === '1' ? 'dark' : 'light');
+}
 
 setInterval(tick, 250);
 tick();
