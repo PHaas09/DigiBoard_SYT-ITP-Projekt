@@ -1,7 +1,11 @@
 // =====================================================
 // ROLE: HOST  (ESP #1)
-// Fixed: Host now follows the current WLAN channel instead of forcing ch11.
-// This keeps ESP-NOW compatible with the client that stays on WLAN for HTTP.
+// Sends live state to BOTH:
+//   - Webserver ESP
+//   - Flask service
+// BUT only for its own LOCAL / AI games.
+// In DUO mode the CLIENT remains the single publisher,
+// so one DUO match becomes one saved history.
 // =====================================================
 struct Move { int r; int c; };
 
@@ -11,17 +15,19 @@ struct Move { int r; int c; };
 #include <XPT2046_Touchscreen.h>
 
 #include <WiFi.h>
+#include <WiFiClient.h>
+#include <HTTPClient.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
 
 #define DUO_FALLBACK_CHANNEL 11
 
-// ===== WLAN =====
 const char* WIFI_SSID = "IOT";
 const char* WIFI_PASS = "20tgmiot18";
+const char* WEBSERVER_PUSH_URL = "http://10.200.0.69/push";
+const char* FLASK_PUSH_URL     = "http://10.200.0.189:5000/push";
 
-// ---------- ESP32-S3 GPIO ----------
 #define TFT_DC    9
 #define TFT_CS   10
 #define TFT_RST   8
@@ -36,40 +42,34 @@ const char* WIFI_PASS = "20tgmiot18";
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 XPT2046_Touchscreen ts(T_CS, T_IRQ);
 
-// ---------- UI ----------
 const uint16_t APPBAR_H = 40;
 const uint16_t FOOTER_H = 20;
 const uint16_t PAD      = 10;
 
-// Touch Kalibrierung
 #define TS_MINX  250
 #define TS_MAXX  3800
 #define TS_MINY  250
 #define TS_MAXY  3800
 
-// Touch Mapping
 #define TOUCH_SWAP_XY   0
 #define TOUCH_INVERT_X  1
 #define TOUCH_INVERT_Y  1
 
-// Buttons
 const int TOPBTN_W = 110;
 const int TOPBTN_H = 28;
 const int SETBTN_W = 110;
 const int SETBTN_H = 18;
 
-// Theme
 bool lightMode = false;
 uint16_t C_BG, C_FG, C_APPBAR, C_APPBAR_TEXT, C_FOOTER_BG, C_FOOTER_TEXT, C_GRID, C_BTN_BG, C_BTN_BORDER, C_BTN_TEXT;
 const uint16_t C_X = ILI9341_ORANGE;
 const uint16_t C_O = ILI9341_CYAN;
 
-// Game
 char board[3][3];
 char currentPlayer = 'X';
 bool gameOver = false;
+char lastWinner = ' ';
 
-// Modes
 enum GameMode { GM_LOCAL_2P, GM_AI_EASY, GM_AI_HARD, GM_DUO };
 GameMode gameMode = GM_LOCAL_2P;
 
@@ -78,15 +78,16 @@ ScreenMode mode = MODE_GAME;
 
 char humanSymbol='X', aiSymbol='O';
 
-// Board geometry
 int bx0, by0, bsize, cell;
 String footerMsg="";
 
-// WLAN / channel
 bool wifiOk = false;
 uint8_t gWifiChannel = 0;
+uint32_t liveGameId = 0;
+uint32_t bootSessionId = 0;
+uint32_t eventCounter = 0;
+char deviceId[20] = {0};
 
-// ---------- DUO (ESP-NOW) ----------
 bool duoWaiting=false;
 bool duoConnected=false;
 
@@ -99,7 +100,6 @@ char remoteSymbol='O';
 
 uint8_t moveSeq = 0;
 
-// Protocol
 enum MsgType : uint8_t { MSG_HELLO=1, MSG_HELLO_ACK=2, MSG_START=3, MSG_MOVE=4, MSG_RESET_REQ=5 };
 
 struct __attribute__((packed)) EspMsg {
@@ -108,9 +108,9 @@ struct __attribute__((packed)) EspMsg {
   uint8_t r;
   uint8_t c;
   uint8_t seq;
-  uint8_t flags;   // START: bit0 = receiverIsX (for client)
-  uint32_t n1;     // HELLO: hostRand, ACK: clientRand, START: hostRand, RESET_REQ(host->client): hostRand
-  uint32_t n2;     // START: clientRand
+  uint8_t flags;
+  uint32_t n1;
+  uint32_t n2;
 };
 
 const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -120,15 +120,19 @@ volatile bool pendingRemoteResetReq=false;
 volatile bool pendingStartFromAck=false;
 volatile uint8_t pendR=255, pendC=255, pendSeq=0;
 
-// Randoms + Reset-Handshake
 uint32_t hostRand=0;
 uint32_t clientRand=0;
 bool awaitingClientRand = false;
 
-// ---------- helpers ----------
 static inline int clampi(int v,int lo,int hi){ return (v<lo)?lo:(v>hi)?hi:v; }
 bool pointInRect(int x,int y,int rx,int ry,int rw,int rh){ return (x>=rx && x<rx+rw && y>=ry && y<ry+rh); }
 bool isSelfMac(const uint8_t mac[6]){ return memcmp(mac,myMac,6)==0; }
+
+void formatMacCompact(const uint8_t mac[6], char* out, size_t outSize){
+  if(outSize < 13) return;
+  snprintf(out, outSize, "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 
 uint8_t getRadioChannel(){
   uint8_t ch = 0;
@@ -196,6 +200,97 @@ bool prepareDuoTransport(){
   return (err == ESP_OK);
 }
 
+void restoreWifiForHttpIfNeeded(){
+  connectWifi(4000);
+}
+
+void beginTrackedGame(){
+  liveGameId++;
+  eventCounter = 0;
+  lastWinner = ' ';
+}
+
+String boardToWire(){
+  String s;
+  s.reserve(9);
+  for(int r=0;r<3;r++){
+    for(int c=0;c<3;c++){
+      char ch = board[r][c];
+      s += (ch==' ') ? '-' : ch;
+    }
+  }
+  return s;
+}
+
+bool postStateToUrl(const char* url, const char* eventName, uint32_t eventIndex){
+  if(WiFi.status() != WL_CONNECTED){
+    wifiOk = false;
+    connectWifi(3000);
+  }
+  if(WiFi.status() != WL_CONNECTED){
+    Serial.print("HOST push skipped (offline) -> ");
+    Serial.println(url);
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(700);
+  http.setTimeout(1000);
+
+  if(!http.begin(client, url)){
+    Serial.print("HOST HTTP begin failed -> ");
+    Serial.println(url);
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  char winnerChar = (lastWinner==' ') ? '_' : lastWinner;
+
+  String body;
+  body.reserve(420);
+  body += "role=HOST";
+  body += "&deviceId="; body += deviceId;
+  body += "&sessionId="; body += String((unsigned long)bootSessionId);
+  body += "&game_id="; body += String((unsigned long)liveGameId);
+  body += "&eventIndex="; body += String((unsigned long)eventIndex);
+  body += "&seq="; body += String((int)moveSeq);
+  body += "&gameMode="; body += String((int)gameMode);
+  body += "&screenMode="; body += String((int)mode);
+  body += "&currentPlayer="; body += currentPlayer;
+  body += "&gameOver="; body += String(gameOver ? 1 : 0);
+  body += "&winner="; body += winnerChar;
+  body += "&duoConnected="; body += String(duoConnected ? 1 : 0);
+  body += "&localSymbol="; body += localSymbol;
+  body += "&remoteSymbol="; body += remoteSymbol;
+  body += "&board="; body += boardToWire();
+  body += "&event="; body += eventName;
+  body += "&channel="; body += String((int)currentEspNowChannel());
+  body += "&uptimeMs="; body += String((unsigned long)millis());
+
+  int httpCode = http.POST(body);
+  String resp = http.getString();
+
+  Serial.print("HOST HTTP -> ");
+  Serial.print(url);
+  Serial.print(" code=");
+  Serial.print(httpCode);
+  Serial.print(" resp=");
+  Serial.println(resp);
+
+  http.end();
+  return (httpCode >= 200 && httpCode < 300);
+}
+
+void pushStateToTargets(const char* eventName){
+  if(gameMode == GM_DUO) return;
+  if(liveGameId == 0) return;
+  uint32_t eventIndex = ++eventCounter;
+  postStateToUrl(WEBSERVER_PUSH_URL, eventName, eventIndex);
+  postStateToUrl(FLASK_PUSH_URL,     eventName, eventIndex);
+}
+
 void updateThemeColors(){
   if(!lightMode){
     C_BG=ILI9341_BLACK; C_FG=ILI9341_WHITE;
@@ -217,6 +312,7 @@ void clearBoardState(){
   currentPlayer='X';
   gameOver=false;
   moveSeq=0;
+  lastWinner=' ';
 }
 
 char checkWinner(){
@@ -243,7 +339,6 @@ void computeBoardRect(){
   cell=bsize/3;
 }
 
-// ---------- draw ----------
 void drawTopButton(const char* label){
   int rx=tft.width()-PAD-TOPBTN_W;
   int ry=(APPBAR_H-TOPBTN_H)/2;
@@ -374,7 +469,6 @@ void drawDuoWaitScreen(){
   tft.print((int)currentEspNowChannel());
 }
 
-// ---------- touch ----------
 bool readTouchScreen(int &sx,int &sy){
   if(!ts.touched()) return false;
   TS_Point p=ts.getPoint();
@@ -389,7 +483,6 @@ bool readTouchScreen(int &sx,int &sy){
   return true;
 }
 
-// ---------- AI ----------
 Move randomMove(){
   int e[9][2]; int n=0;
   for(int r=0;r<3;r++) for(int c=0;c<3;c++) if(board[r][c]==' '){ e[n][0]=r; e[n][1]=c; n++; }
@@ -446,12 +539,11 @@ String turnMessage(){
   return "";
 }
 
-// ---------- ESPNOW ----------
 bool ensurePeer(const uint8_t mac[6]){
   if(esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t p{};
   memcpy(p.peer_addr, mac, 6);
-  p.channel = 0;              // use current local channel
+  p.channel = 0;
   p.encrypt = false;
   p.ifidx   = WIFI_IF_STA;
   return (esp_now_add_peer(&p) == ESP_OK);
@@ -480,7 +572,6 @@ void duoStartAsHost(){
   }
 }
 
-// HOST: send HELLO broadcast (contains hostRand)
 void sendHelloBroadcast(){
   EspMsg m{};
   m.type=MSG_HELLO; m.ver=1;
@@ -489,7 +580,6 @@ void sendHelloBroadcast(){
   esp_now_send(BCAST, (uint8_t*)&m, sizeof(m));
 }
 
-// HOST: send RESET_REQ to client to request new clientRand
 void sendResetReqToClient(){
   if(!havePeer) return;
   EspMsg m{};
@@ -499,7 +589,6 @@ void sendResetReqToClient(){
   esp_now_send(peerMac, (uint8_t*)&m, sizeof(m));
 }
 
-// HOST: after got clientRand -> send START (random who is X)
 void sendStartToClient(){
   if(!havePeer) return;
 
@@ -514,7 +603,6 @@ void sendStartToClient(){
   ensurePeer(peerMac);
   esp_now_send(peerMac, (uint8_t*)&m, sizeof(m));
 
-  // Host sets symbols
   localSymbol  = clientIsX ? 'O' : 'X';
   remoteSymbol = clientIsX ? 'X' : 'O';
 
@@ -531,7 +619,6 @@ void sendStartToClient(){
   setFooter(turnMessage());
 }
 
-// Start new DUO game
 void beginNewDuoGame(){
   if(!(gameMode==GM_DUO && duoConnected && havePeer)) return;
   hostRand = esp_random();
@@ -549,7 +636,6 @@ void sendMoveToClient(uint8_t r,uint8_t c,uint8_t seq){
   esp_now_send(peerMac, (uint8_t*)&m, sizeof(m));
 }
 
-// ESP32 Core 3.x recv cb
 void onRecv(const esp_now_recv_info *info, const uint8_t *data, int len){
   if(!info) return;
   const uint8_t* mac = info->src_addr;
@@ -582,8 +668,8 @@ void onRecv(const esp_now_recv_info *info, const uint8_t *data, int len){
   }
 }
 
-// ---------- gameplay ----------
 void setGameOverFooter(char w){
+  lastWinner = w;
   if(w=='X' || w=='O'){ gameOver=true; setFooter(String(w)+" gewinnt! (Neu)"); }
   else if(w=='D'){ gameOver=true; setFooter("Unentschieden! (Neu)"); }
 }
@@ -618,7 +704,9 @@ void maybeAIMove(){
 
   Move m = (gameMode==GM_AI_HARD) ? bestMove() : randomMove();
   if(m.r<0) return;
-  applyMove(m.r,m.c,aiSymbol,true);
+  if(applyMove(m.r,m.c,aiSymbol,true)){
+    pushStateToTargets(gameOver ? "gameover" : "move");
+  }
 }
 
 void redrawGame(){
@@ -632,14 +720,18 @@ void redrawGame(){
 void startLocal2P(){
   duoResetLocalState();
   gameMode=GM_LOCAL_2P;
+  restoreWifiForHttpIfNeeded();
   humanSymbol='X'; aiSymbol='O';
+  beginTrackedGame();
   clearBoardState();
   redrawGame();
+  pushStateToTargets("start");
 }
 
 void startAI(GameMode m){
   duoResetLocalState();
   gameMode=m;
+  restoreWifiForHttpIfNeeded();
   drawAIStartScreen();
 }
 
@@ -655,7 +747,6 @@ bool settingsHit(int x,int y){
   return pointInRect(x,y,rx,ry,SETBTN_W,SETBTN_H);
 }
 
-// ---------- setup/loop ----------
 void setup(){
   Serial.begin(115200);
 
@@ -669,6 +760,8 @@ void setup(){
 
   connectWifi();
   esp_wifi_get_mac(WIFI_IF_STA, myMac);
+  formatMacCompact(myMac, deviceId, sizeof(deviceId));
+  bootSessionId = esp_random();
 
   if(esp_now_init()!=ESP_OK){
     Serial.println("ESP-NOW init failed");
@@ -680,10 +773,14 @@ void setup(){
   tft.fillScreen(C_BG);
   clearBoardState();
   redrawGame();
+
+  Serial.print("HOST deviceId=");
+  Serial.println(deviceId);
+  Serial.print("HOST bootSessionId=");
+  Serial.println((unsigned long)bootSessionId);
 }
 
 void loop(){
-  // HOST: in DUO wait -> HELLO broadcast
   static uint32_t lastHello=0;
   if(mode==MODE_DUO_WAIT && duoWaiting && !duoConnected){
     if(millis()-lastHello > 600){
@@ -716,7 +813,6 @@ void loop(){
   delay(30);
   while(ts.touched()) delay(10);
 
-  // Top button: Neu / Zurueck
   if(topHit(x,y)){
     if(mode==MODE_GAME){
       if(gameMode==GM_DUO){
@@ -727,14 +823,17 @@ void loop(){
           redrawGame();
         }
       } else {
+        beginTrackedGame();
         clearBoardState();
         redrawGame();
+        pushStateToTargets("start");
         maybeAIMove();
       }
     } else {
       if(mode==MODE_DUO_WAIT){
         duoResetLocalState();
         gameMode=GM_LOCAL_2P;
+        restoreWifiForHttpIfNeeded();
         clearBoardState();
         redrawGame();
       } else {
@@ -745,13 +844,11 @@ void loop(){
     return;
   }
 
-  // Settings
   if(settingsHit(x,y)){
     drawSettingsScreen();
     return;
   }
 
-  // Settings screen input
   if(mode==MODE_SETTINGS){
     int W=tft.width(), bw=W-2*PAD, bh=40, y0=APPBAR_H+18;
     if(pointInRect(x,y,PAD,y0,bw,bh)){ startLocal2P(); return; }
@@ -769,27 +866,30 @@ void loop(){
     return;
   }
 
-  // AI start
   if(mode==MODE_AI_START){
     int W=tft.width(), bw=W-2*PAD, bh=44, y0=APPBAR_H+55;
     if(pointInRect(x,y,PAD,y0,bw,bh)){
       humanSymbol='X'; aiSymbol='O';
-      clearBoardState(); redrawGame();
+      beginTrackedGame();
+      clearBoardState();
+      redrawGame();
+      pushStateToTargets("start");
       return;
     }
     if(pointInRect(x,y,PAD,y0+70,bw,bh)){
       aiSymbol='X'; humanSymbol='O';
-      clearBoardState(); redrawGame();
+      beginTrackedGame();
+      clearBoardState();
+      redrawGame();
+      pushStateToTargets("start");
       maybeAIMove();
       return;
     }
     return;
   }
 
-  // DUO wait ignore
   if(mode==MODE_DUO_WAIT) return;
 
-  // Game touches
   if(mode!=MODE_GAME || gameOver) return;
   if(!pointInRect(x,y,bx0,by0,bsize,bsize)) return;
 
@@ -798,13 +898,18 @@ void loop(){
   if(r<0||r>2||c<0||c>2) return;
 
   if(gameMode==GM_LOCAL_2P){
-    applyMove(r,c,currentPlayer,true);
+    if(applyMove(r,c,currentPlayer,true)){
+      pushStateToTargets(gameOver ? "gameover" : "move");
+    }
     return;
   }
 
   if(gameMode==GM_AI_EASY || gameMode==GM_AI_HARD){
     if(currentPlayer != humanSymbol) return;
-    if(applyMove(r,c,humanSymbol,true)) maybeAIMove();
+    if(applyMove(r,c,humanSymbol,true)){
+      pushStateToTargets(gameOver ? "gameover" : "move");
+      maybeAIMove();
+    }
     return;
   }
 
