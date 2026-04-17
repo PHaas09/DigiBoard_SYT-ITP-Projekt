@@ -86,6 +86,8 @@ uint8_t gWifiChannel = 0;
 uint32_t liveGameId = 0;
 uint32_t bootSessionId = 0;
 uint32_t eventCounter = 0;
+uint32_t localGameCounter = 0;
+uint32_t deviceHash = 0;
 char deviceId[20] = {0};
 
 bool duoWaiting=false;
@@ -132,6 +134,21 @@ void formatMacCompact(const uint8_t mac[6], char* out, size_t outSize){
   if(outSize < 13) return;
   snprintf(out, outSize, "%02X%02X%02X%02X%02X%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+uint32_t makeDeviceHash(const uint8_t mac[6]){
+  return ((uint32_t)mac[2] << 24) |
+         ((uint32_t)mac[3] << 16) |
+         ((uint32_t)mac[4] << 8)  |
+         ((uint32_t)mac[5]);
+}
+
+uint32_t nextGameId(){
+  localGameCounter++;
+  uint32_t id = bootSessionId ^ deviceHash ^ (0x9E3779B9UL * localGameCounter);
+  if(id == 0) id = deviceHash ? deviceHash : localGameCounter;
+  if(id == 0) id = 1;
+  return id;
 }
 
 uint8_t getRadioChannel(){
@@ -205,7 +222,7 @@ void restoreWifiForHttpIfNeeded(){
 }
 
 void beginTrackedGame(){
-  liveGameId++;
+  liveGameId = nextGameId();
   eventCounter = 0;
   lastWinner = ' ';
 }
@@ -761,6 +778,7 @@ void setup(){
   connectWifi();
   esp_wifi_get_mac(WIFI_IF_STA, myMac);
   formatMacCompact(myMac, deviceId, sizeof(deviceId));
+  deviceHash = makeDeviceHash(myMac);
   bootSessionId = esp_random();
 
   if(esp_now_init()!=ESP_OK){
