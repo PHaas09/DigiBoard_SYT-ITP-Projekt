@@ -26,7 +26,6 @@ struct Move { int r; int c; };
 const char* WIFI_SSID = "IOT";
 const char* WIFI_PASS = "20tgmiot18";
 const char* WEBSERVER_PUSH_URL = "http://10.200.0.69/push";
-const char* FLASK_PUSH_URL     = "http://10.200.0.189:5000/push"; // kann sich ändern
 
 // ---------- ESP32-S3 GPIO ----------
 #define TFT_DC    9
@@ -61,8 +60,15 @@ const int TOPBTN_H = 28;
 const int SETBTN_W = 110;
 const int SETBTN_H = 18;
 
-bool lightMode=false;
+const int KEY_W = 62;
+const int KEY_H = 36;
+const int KEY_GAP = 8;
+
+enum ThemeMode { TM_DARK, TM_LIGHT, TM_CITRUS };
+ThemeMode themeMode = TM_DARK;
+
 uint16_t C_BG, C_FG, C_APPBAR, C_APPBAR_TEXT, C_FOOTER_BG, C_FOOTER_TEXT, C_GRID, C_BTN_BG, C_BTN_BORDER, C_BTN_TEXT;
+uint16_t C_DECOR_LEMON, C_DECOR_LEMON_EDGE, C_DECOR_LEAF, C_DECOR_PULP;
 const uint16_t C_X = ILI9341_ORANGE;
 const uint16_t C_O = ILI9341_CYAN;
 
@@ -74,7 +80,14 @@ char lastWinner=' ';
 enum GameMode { GM_LOCAL_2P, GM_AI_EASY, GM_AI_HARD, GM_DUO };
 GameMode gameMode = GM_LOCAL_2P;
 
-enum ScreenMode { MODE_GAME, MODE_SETTINGS, MODE_AI_START, MODE_DUO_WAIT };
+enum ScreenMode {
+  MODE_GAME,
+  MODE_SETTINGS,
+  MODE_AI_START,
+  MODE_DUO_WAIT,
+  MODE_DUO_SAVE_PROMPT,
+  MODE_IP_ENTRY
+};
 ScreenMode mode = MODE_GAME;
 
 char humanSymbol='X', aiSymbol='O';
@@ -85,6 +98,12 @@ String footerMsg="";
 // DUO
 bool duoWaiting=false;
 bool duoConnected=false;
+
+// save / ip config
+bool saveGamesEnabled = false;
+char flaskPushUrl[64] = {0};
+char ipInput[16] = {0};
+uint8_t ipInputLen = 0;
 
 uint8_t myMac[6];
 uint8_t hostMac[6];
@@ -135,6 +154,109 @@ uint32_t clientRand=0;
 static inline int clampi(int v,int lo,int hi){ return (v<lo)?lo:(v>hi)?hi:v; }
 bool pointInRect(int x,int y,int rx,int ry,int rw,int rh){ return (x>=rx && x<rx+rw && y>=ry && y<ry+rh); }
 bool isSelfMac(const uint8_t mac[6]){ return memcmp(mac,myMac,6)==0; }
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b){ return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
+
+const char* themeLabel(){
+  if(themeMode == TM_LIGHT) return "Theme: Hell";
+  if(themeMode == TM_CITRUS) return "Theme: Citrus";
+  return "Theme: Dunkel";
+}
+
+void cycleTheme(){
+  if(themeMode == TM_DARK) themeMode = TM_LIGHT;
+  else if(themeMode == TM_LIGHT) themeMode = TM_CITRUS;
+  else themeMode = TM_DARK;
+}
+
+void resetIpInput(){
+  ipInput[0] = '\0';
+  ipInputLen = 0;
+}
+
+bool validateIpString(const char* s){
+  int parts = 0;
+  int value = -1;
+  int digits = 0;
+
+  for(size_t i=0;;i++){
+    char ch = s[i];
+    if(ch >= '0' && ch <= '9'){
+      if(value < 0) value = 0;
+      value = value * 10 + (ch - '0');
+      digits++;
+      if(value > 255) return false;
+      if(digits > 3) return false;
+    } else if(ch == '.' || ch == '\0'){
+      if(digits == 0) return false;
+      parts++;
+      if(value < 0 || value > 255) return false;
+      value = -1;
+      digits = 0;
+      if(ch == '\0') break;
+    } else {
+      return false;
+    }
+  }
+  return (parts == 4);
+}
+
+void setFlaskTargetFromIp(const char* ip){
+  snprintf(flaskPushUrl, sizeof(flaskPushUrl), "http://%s:5000/push", ip);
+}
+
+void appendIpChar(char ch){
+  if(ipInputLen >= sizeof(ipInput)-1) return;
+
+  if(ch == '.'){
+    if(ipInputLen == 0) return;
+    if(ipInput[ipInputLen-1] == '.') return;
+  } else if(ch >= '0' && ch <= '9'){
+    int start = ipInputLen - 1;
+    while(start >= 0 && ipInput[start] != '.') start--;
+    start++;
+    int segLen = ipInputLen - start;
+    if(segLen >= 3) return;
+  } else {
+    return;
+  }
+
+  ipInput[ipInputLen++] = ch;
+  ipInput[ipInputLen] = '\0';
+}
+
+void backspaceIpChar(){
+  if(ipInputLen == 0) return;
+  ipInputLen--;
+  ipInput[ipInputLen] = '\0';
+}
+
+void drawLemonDecoration(int cx,int cy,int size){
+  if(themeMode != TM_CITRUS) return;
+
+  int ry = max(4, size / 2);
+  int inner = max(3, size / 3);
+
+  tft.fillRect(cx-inner, cy-ry, 2*inner+1, 2*ry+1, C_DECOR_LEMON);
+  tft.fillCircle(cx-inner, cy, ry, C_DECOR_LEMON);
+  tft.fillCircle(cx+inner, cy, ry, C_DECOR_LEMON);
+
+  tft.drawRect(cx-inner, cy-ry, 2*inner+1, 2*ry+1, C_DECOR_LEMON_EDGE);
+  tft.drawCircle(cx-inner, cy, ry, C_DECOR_LEMON_EDGE);
+  tft.drawCircle(cx+inner, cy, ry, C_DECOR_LEMON_EDGE);
+
+  tft.fillTriangle(cx-inner+1, cy-ry-1, cx-inner+10, cy-ry-7, cx-inner+14, cy-ry+3, C_DECOR_LEAF);
+  tft.fillTriangle(cx+inner-2, cy-ry, cx+inner+6, cy-ry-6, cx+inner+10, cy-ry+4, C_DECOR_LEAF);
+
+  tft.fillCircle(cx-inner/2, cy, 2, C_DECOR_PULP);
+  tft.fillCircle(cx+inner/2, cy-3, 2, C_DECOR_PULP);
+}
+
+void drawCitrusScreenDecor(){
+  if(themeMode != TM_CITRUS) return;
+  drawLemonDecoration(34, APPBAR_H + 18, 12);
+  drawLemonDecoration(tft.width() - 34, APPBAR_H + 34, 12);
+  drawLemonDecoration(50, tft.height() - FOOTER_H - 18, 10);
+}
 
 void formatMacCompact(const uint8_t mac[6], char* out, size_t outSize){
   if(outSize < 13) return;
@@ -246,6 +368,8 @@ String boardToWire(){
 }
 
 bool postStateToUrl(const char* url, const char* eventName, uint32_t eventIndex){
+  if(!url || !url[0]) return false;
+
   if(WiFi.status() != WL_CONNECTED){
     wifiOk = false;
     connectWifi(3000);
@@ -310,22 +434,36 @@ void pushStateToTargets(const char* eventName){
   if(liveGameId == 0) return;
   uint32_t eventIndex = ++eventCounter;
   postStateToUrl(WEBSERVER_PUSH_URL, eventName, eventIndex);
-  postStateToUrl(FLASK_PUSH_URL,     eventName, eventIndex);
+  if(saveGamesEnabled && flaskPushUrl[0]){
+    postStateToUrl(flaskPushUrl, eventName, eventIndex);
+  }
 }
 
 void updateThemeColors(){
-  if(!lightMode){
+  if(themeMode == TM_DARK){
     C_BG=ILI9341_BLACK; C_FG=ILI9341_WHITE;
     C_APPBAR=ILI9341_NAVY; C_APPBAR_TEXT=ILI9341_WHITE;
     C_FOOTER_BG=ILI9341_BLACK; C_FOOTER_TEXT=ILI9341_LIGHTGREY;
     C_GRID=ILI9341_WHITE;
     C_BTN_BG=ILI9341_DARKGREY; C_BTN_BORDER=ILI9341_LIGHTGREY; C_BTN_TEXT=ILI9341_WHITE;
-  } else {
+    C_DECOR_LEMON=ILI9341_DARKGREY; C_DECOR_LEMON_EDGE=ILI9341_LIGHTGREY; C_DECOR_LEAF=ILI9341_GREEN; C_DECOR_PULP=ILI9341_WHITE;
+  } else if(themeMode == TM_LIGHT){
     C_BG=ILI9341_WHITE; C_FG=ILI9341_BLACK;
     C_APPBAR=ILI9341_LIGHTGREY; C_APPBAR_TEXT=ILI9341_BLACK;
     C_FOOTER_BG=ILI9341_WHITE; C_FOOTER_TEXT=ILI9341_DARKGREY;
     C_GRID=ILI9341_BLACK;
     C_BTN_BG=ILI9341_LIGHTGREY; C_BTN_BORDER=ILI9341_DARKGREY; C_BTN_TEXT=ILI9341_BLACK;
+    C_DECOR_LEMON=ILI9341_YELLOW; C_DECOR_LEMON_EDGE=ILI9341_ORANGE; C_DECOR_LEAF=ILI9341_GREEN; C_DECOR_PULP=ILI9341_WHITE;
+  } else {
+    C_BG=rgb565(255,253,241); C_FG=rgb565(61,50,0);
+    C_APPBAR=rgb565(242,194,0); C_APPBAR_TEXT=rgb565(61,50,0);
+    C_FOOTER_BG=rgb565(255,248,217); C_FOOTER_TEXT=rgb565(122,106,26);
+    C_GRID=rgb565(214,180,0);
+    C_BTN_BG=rgb565(255,248,217); C_BTN_BORDER=rgb565(214,180,0); C_BTN_TEXT=rgb565(61,50,0);
+    C_DECOR_LEMON=rgb565(255,228,92);
+    C_DECOR_LEMON_EDGE=rgb565(214,180,0);
+    C_DECOR_LEAF=rgb565(109,187,82);
+    C_DECOR_PULP=rgb565(255,245,180);
   }
 }
 
@@ -402,7 +540,7 @@ void setFooter(const String& msg){
   tft.setTextColor(C_FOOTER_TEXT,C_FOOTER_BG);
   tft.setCursor(10,tft.height()-FOOTER_H+6);
   tft.print(footerMsg);
-  drawFooterButtonSettings();
+  if(mode == MODE_GAME) drawFooterButtonSettings();
 }
 
 void drawX(int cx,int cy,int r){
@@ -430,6 +568,13 @@ void drawMark(int r,int c,char m){
 void drawBoard(){
   computeBoardRect();
   tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
+
+  if(themeMode == TM_CITRUS){
+    drawLemonDecoration(28, max(APPBAR_H + 16, by0 - 18), 10);
+    drawLemonDecoration(tft.width() - 30, by0 + (bsize / 2), 12);
+    drawLemonDecoration(48, min(tft.height() - FOOTER_H - 18, by0 + bsize + 18), 10);
+  }
+
   tft.drawRoundRect(bx0,by0,bsize,bsize,8,C_GRID);
   tft.drawFastVLine(bx0+cell,by0,bsize,C_GRID);
   tft.drawFastVLine(bx0+2*cell,by0,bsize,C_GRID);
@@ -452,6 +597,7 @@ void drawSettingsScreen(){
   drawAppBar("Einstellungen");
   setFooter("Modus / Theme waehlen");
   tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
+  drawCitrusScreenDecor();
   int W=tft.width(); int bw=W-2*PAD; int bh=40; int y0=APPBAR_H+18;
   drawBigButton(PAD,y0,bw,bh,"2 Spieler");
   drawBigButton(PAD,y0+48,bw,bh,"KI Leicht");
@@ -463,7 +609,7 @@ void drawSettingsScreen(){
   tft.setTextSize(2);
   tft.setTextColor(C_BTN_TEXT,C_BTN_BG);
   tft.setCursor(PAD+14,ty+8);
-  tft.print(lightMode ? "Theme: Hell" : "Theme: Dunkel");
+  tft.print(themeLabel());
 }
 
 void drawAIStartScreen(){
@@ -471,9 +617,79 @@ void drawAIStartScreen(){
   drawAppBar("KI Setup");
   setFooter("Wer startet? Starter ist X");
   tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
+  drawCitrusScreenDecor();
   int W=tft.width(); int bw=W-2*PAD; int bh=44; int y0=APPBAR_H+55;
   drawBigButton(PAD,y0,bw,bh,"Ich");
   drawBigButton(PAD,y0+70,bw,bh,"KI");
+}
+
+void drawDuoSavePrompt(){
+  mode = MODE_DUO_SAVE_PROMPT;
+  drawAppBar("DUO Setup");
+  setFooter("Speichern waehlen");
+  tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
+  drawCitrusScreenDecor();
+
+  tft.setTextSize(2);
+  tft.setTextColor(C_FG, C_BG);
+  tft.setCursor(PAD, APPBAR_H + 20);
+  tft.print("Spiele speichern?");
+
+  int bw = tft.width() - 2*PAD;
+  drawBigButton(PAD, APPBAR_H + 58, bw, 48, "Nicht speichern");
+  drawBigButton(PAD, APPBAR_H + 118, bw, 48, "Speichern + IP");
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_FOOTER_TEXT, C_BG);
+  tft.setCursor(PAD, APPBAR_H + 185);
+  tft.print("Bei Speichern gibst du die Empfaenger-IP");
+  tft.setCursor(PAD, APPBAR_H + 199);
+  tft.print("direkt am Display ein.");
+}
+
+void drawIpEntryScreen(){
+  mode = MODE_IP_ENTRY;
+  drawAppBar("Empfaenger IP");
+  setFooter("IP eingeben, dann OK");
+  tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
+  drawCitrusScreenDecor();
+
+  tft.setTextSize(2);
+  tft.setTextColor(C_FG, C_BG);
+  tft.setCursor(PAD, APPBAR_H + 8);
+  tft.print("IP fuer Flask:");
+
+  int fieldY = APPBAR_H + 34;
+  tft.fillRoundRect(PAD, fieldY, tft.width()-2*PAD, 32, 8, C_BTN_BG);
+  tft.drawRoundRect(PAD, fieldY, tft.width()-2*PAD, 32, 8, C_BTN_BORDER);
+  tft.setTextColor(C_BTN_TEXT, C_BTN_BG);
+  tft.setCursor(PAD + 8, fieldY + 9);
+  tft.print(ipInputLen ? ipInput : "_");
+
+  const char* labels[12] = {"1","2","3","4","5","6","7","8","9",".","0","<"};
+  int startX = PAD + 7;
+  int startY = APPBAR_H + 78;
+  for(int i=0;i<12;i++){
+    int col = i % 3;
+    int row = i / 3;
+    int x = startX + col * (KEY_W + KEY_GAP);
+    int y = startY + row * (KEY_H + KEY_GAP);
+    tft.fillRoundRect(x,y,KEY_W,KEY_H,8,C_BTN_BG);
+    tft.drawRoundRect(x,y,KEY_W,KEY_H,8,C_BTN_BORDER);
+    tft.setTextSize(2);
+    tft.setTextColor(C_BTN_TEXT, C_BTN_BG);
+    tft.setCursor(x + 24, y + 10);
+    tft.print(labels[i]);
+  }
+
+  int okY = startY + 4*(KEY_H + KEY_GAP) + 4;
+  int okW = tft.width() - 2*PAD;
+  tft.fillRoundRect(PAD, okY, okW, 34, 8, C_BTN_BG);
+  tft.drawRoundRect(PAD, okY, okW, 34, 8, C_BTN_BORDER);
+  tft.setTextSize(2);
+  tft.setTextColor(C_BTN_TEXT, C_BTN_BG);
+  tft.setCursor(PAD + okW/2 - 14, okY + 9);
+  tft.print("OK");
 }
 
 void drawDuoWaitScreen(){
@@ -481,6 +697,7 @@ void drawDuoWaitScreen(){
   drawAppBar("DUO (CLIENT)");
   setFooter("Warte auf HOST...");
   tft.fillRect(0,APPBAR_H,tft.width(),tft.height()-APPBAR_H-FOOTER_H,C_BG);
+  drawCitrusScreenDecor();
   tft.setTextSize(2);
   tft.setTextColor(C_FG,C_BG);
   tft.setCursor(PAD,APPBAR_H+40);
@@ -489,6 +706,13 @@ void drawDuoWaitScreen(){
   tft.setCursor(PAD,APPBAR_H+70);
   tft.print("Kanal: ");
   tft.print((int)currentEspNowChannel());
+  tft.setCursor(PAD,APPBAR_H+86);
+  tft.print("Speichern: ");
+  tft.print(saveGamesEnabled ? "Ja" : "Nein");
+  if(saveGamesEnabled && flaskPushUrl[0]){
+    tft.setCursor(PAD,APPBAR_H+100);
+    tft.print(flaskPushUrl);
+  }
 }
 
 bool readTouchScreen(int &sx,int &sy){
@@ -740,6 +964,36 @@ bool settingsHit(int x,int y){
   return pointInRect(x,y,rx,ry,SETBTN_W,SETBTN_H);
 }
 
+bool duoPromptNoSaveHit(int x,int y){
+  int bw = tft.width() - 2*PAD;
+  return pointInRect(x,y,PAD,APPBAR_H+58,bw,48);
+}
+
+bool duoPromptSaveHit(int x,int y){
+  int bw = tft.width() - 2*PAD;
+  return pointInRect(x,y,PAD,APPBAR_H+118,bw,48);
+}
+
+int ipKeyIndexAt(int x,int y){
+  int startX = PAD + 7;
+  int startY = APPBAR_H + 78;
+  for(int i=0;i<12;i++){
+    int col = i % 3;
+    int row = i / 3;
+    int rx = startX + col * (KEY_W + KEY_GAP);
+    int ry = startY + row * (KEY_H + KEY_GAP);
+    if(pointInRect(x,y,rx,ry,KEY_W,KEY_H)) return i;
+  }
+  return -1;
+}
+
+bool ipOkHit(int x,int y){
+  int startY = APPBAR_H + 78;
+  int okY = startY + 4*(KEY_H + KEY_GAP) + 4;
+  int okW = tft.width() - 2*PAD;
+  return pointInRect(x,y,PAD,okY,okW,34);
+}
+
 void setup(){
   Serial.begin(115200);
 
@@ -850,6 +1104,10 @@ void loop(){
         restoreWifiForHttpIfNeeded();
         clearBoardState();
         redrawGame();
+      } else if(mode==MODE_DUO_SAVE_PROMPT){
+        drawSettingsScreen();
+      } else if(mode==MODE_IP_ENTRY){
+        drawDuoSavePrompt();
       } else {
         mode=MODE_GAME;
         redrawGame();
@@ -858,7 +1116,7 @@ void loop(){
     return;
   }
 
-  if(settingsHit(x,y)){
+  if(settingsHit(x,y) && mode==MODE_GAME){
     drawSettingsScreen();
     return;
   }
@@ -868,13 +1126,52 @@ void loop(){
     if(pointInRect(x,y,PAD,y0,bw,bh)){ startLocal2P(); return; }
     if(pointInRect(x,y,PAD,y0+48,bw,bh)){ startAI(GM_AI_EASY); return; }
     if(pointInRect(x,y,PAD,y0+96,bw,bh)){ startAI(GM_AI_HARD); return; }
-    if(pointInRect(x,y,PAD,y0+144,bw,bh)){ duoStartAsClient(); return; }
+    if(pointInRect(x,y,PAD,y0+144,bw,bh)){ drawDuoSavePrompt(); return; }
 
     int ty=y0+196, th=34;
     if(pointInRect(x,y,PAD,ty,bw,th)){
-      lightMode=!lightMode;
+      cycleTheme();
       updateThemeColors();
       drawSettingsScreen();
+      return;
+    }
+    return;
+  }
+
+  if(mode==MODE_DUO_SAVE_PROMPT){
+    if(duoPromptNoSaveHit(x,y)){
+      saveGamesEnabled = false;
+      flaskPushUrl[0] = '\0';
+      duoStartAsClient();
+      return;
+    }
+    if(duoPromptSaveHit(x,y)){
+      resetIpInput();
+      drawIpEntryScreen();
+      return;
+    }
+    return;
+  }
+
+  if(mode==MODE_IP_ENTRY){
+    int idx = ipKeyIndexAt(x,y);
+    if(idx >= 0){
+      const char keys[12] = {'1','2','3','4','5','6','7','8','9','.','0','<'};
+      char key = keys[idx];
+      if(key == '<') backspaceIpChar();
+      else appendIpChar(key);
+      drawIpEntryScreen();
+      return;
+    }
+    if(ipOkHit(x,y)){
+      if(validateIpString(ipInput)){
+        saveGamesEnabled = true;
+        setFlaskTargetFromIp(ipInput);
+        duoStartAsClient();
+      } else {
+        setFooter("Ungueltige IP");
+        drawIpEntryScreen();
+      }
       return;
     }
     return;
